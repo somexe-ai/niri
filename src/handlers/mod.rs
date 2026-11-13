@@ -24,9 +24,10 @@ use smithay::output::Output;
 use smithay::reexports::rustix::fs::{fcntl_setfl, OFlags};
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
+use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -94,7 +95,13 @@ impl SeatHandler for State {
         &mut self.niri.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, mut image: CursorImageStatus) {
+    fn cursor_image(&mut self, seat: &Seat<Self>, mut image: CursorImageStatus) {
+        // Agent pointers are deliberately not rendered as the user's cursor. A client changing
+        // the cursor shape on a background seat must therefore not mutate the primary cursor.
+        if self.niri.agent_seats.iter().any(|agent| agent == seat) {
+            return;
+        }
+
         // FIXME: this hack should be removable once the screenshot UI is tracked with a
         // PointerFocus properly.
         if self.niri.screenshot_ui.is_open() {
@@ -112,7 +119,11 @@ impl SeatHandler for State {
         set_primary_focus(dh, seat, client);
     }
 
-    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: keyboard::LedState) {
+    fn led_state_changed(&mut self, seat: &Seat<Self>, led_state: keyboard::LedState) {
+        // Synthetic keyboards must not toggle LEDs on physical keyboards.
+        if self.niri.agent_seats.iter().any(|agent| agent == seat) {
+            return;
+        }
         self.update_keyboard_leds(led_state);
     }
 
@@ -453,6 +464,7 @@ impl SessionLockHandler for State {
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
+        self.clear_agent_focus();
         self.niri.lock(confirmation);
     }
 
@@ -524,13 +536,57 @@ impl ForeignToplevelHandler for State {
         &mut self.niri.foreign_toplevel_state
     }
 
-    fn activate(&mut self, wl_surface: WlSurface) {
+    fn activate(&mut self, wl_surface: WlSurface, wl_seat: WlSeat) -> bool {
+        // wlr-foreign-toplevel carries the requesting wl_seat. Honor that seat instead of
+        // collapsing every activation onto the physical/user seat.
+        //
+        // For an agent seat, activation means "give this seat keyboard focus" only: do not raise
+        // the window, switch workspaces, or mutate niri's primary layout focus.
+        if let Some(agent_seat) = self.agent_seat_for(&wl_seat) {
+            if !self.niri.agent_input_allowed()
+                || self
+                    .niri
+                    .layout
+                    .find_window_and_output(&wl_surface)
+                    .is_none()
+            {
+                return false;
+            }
+
+            let Some(keyboard) = agent_seat.get_keyboard() else {
+                return false;
+            };
+
+            // Drop dead resources opportunistically, then bind the target to this client's
+            // concrete wl_seat resource. A new Wayland connection selecting the same agent seat
+            // starts unbound.
+            self.niri
+                .agent_pointer_targets
+                .retain(|seat, surface| seat.is_alive() && surface.is_alive());
+            self.niri
+                .agent_pointer_targets
+                .insert(wl_seat, wl_surface.clone());
+
+            keyboard.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+
+            // Tell the protocol layer that this was an isolated activation so it can
+            // acknowledge it only to the requesting management client.
+            return true;
+        }
+
+        // Reject a seat resource that is neither one of our agent seats nor the primary seat
+        // instead of silently upgrading it to primary focus.
+        if !self.niri.seat.owns(&wl_seat) {
+            return false;
+        }
+
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
             self.niri.layout.activate_window(&window);
             self.niri.layer_shell_on_demand_focus = None;
             self.niri.queue_redraw_all();
         }
+        false
     }
 
     fn close(&mut self, wl_surface: WlSurface) {
@@ -649,7 +705,7 @@ impl ScreencopyHandler for State {
 
 impl VirtualPointerHandler for State {
     fn process_virtual_pointer_event(&mut self, event: InputEvent<VirtualPointerBackend>) {
-        self.process_input_event(event);
+        self.process_virtual_pointer_input(event);
     }
 }
 

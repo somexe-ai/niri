@@ -34,15 +34,20 @@ use smithay::input::tablet::{TabletDescriptor, TabletSeatHandler, TabletSeatTrai
 use smithay::input::touch::{
     DownEvent, GrabStartData as TouchGrabStartData, MotionEvent as TouchMotionEvent, UpEvent,
 };
-use smithay::input::{tablet, SeatHandler};
+use smithay::input::{tablet, Seat, SeatHandler};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
+use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::shell::wlr_layer::{self, Layer};
 use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
+use smithay::wayland::virtual_pointer::{
+    VirtualPointerAxisEvent, VirtualPointerBackend, VirtualPointerButtonEvent,
+    VirtualPointerDevice, VirtualPointerMotionAbsoluteEvent, VirtualPointerMotionEvent,
+};
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::move_grab::MoveGrab;
@@ -56,7 +61,7 @@ use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::dbus::gnome_shell::GlobalShortcutsPortalBinds;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
-use crate::niri::{CastTarget, Niri, PointerVisibility, State};
+use crate::niri::{CastTarget, Niri, PointContents, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -331,6 +336,286 @@ impl State {
         if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
             self.niri.seat.remove_touch();
         }
+    }
+
+    /// Returns the agent seat that owns the given client-side `wl_seat`, if any.
+    pub fn agent_seat_for(&self, wl_seat: &WlSeat) -> Option<Seat<State>> {
+        self.niri
+            .agent_seats
+            .iter()
+            .find(|seat| seat.owns(wl_seat))
+            .cloned()
+    }
+
+    /// Drops every agent keyboard focus, pointer focus and activation target.
+    ///
+    /// Called when session locking begins. Virtual keyboard objects that were already created are
+    /// dispatched without going through the lock check, so clearing focus is the fail-closed
+    /// boundary for them.
+    pub fn clear_agent_focus(&mut self) {
+        let serial = SERIAL_COUNTER.next_serial();
+        self.niri.agent_pointer_targets.clear();
+        for seat in self.niri.agent_seats.clone() {
+            if let Some(keyboard) = seat.get_keyboard() {
+                keyboard.set_focus(self, None, serial);
+            }
+            if let Some(pointer) = seat.get_pointer() {
+                pointer.motion(
+                    self,
+                    None,
+                    &MotionEvent {
+                        location: pointer.current_location(),
+                        serial,
+                        time: InputTime::now(),
+                    },
+                );
+                pointer.frame(self);
+            }
+        }
+    }
+
+    /// Handles an event from a `zwlr_virtual_pointer_v1`.
+    ///
+    /// Pointers created for one of the agent seats are dispatched through that seat in isolation.
+    /// Everything else goes through the regular input pipeline.
+    pub fn process_virtual_pointer_input(&mut self, event: InputEvent<VirtualPointerBackend>) {
+        let agent = match &event {
+            InputEvent::PointerMotion { event } => {
+                self.virtual_pointer_agent_context(&event.device())
+            }
+            InputEvent::PointerMotionAbsolute { event } => {
+                self.virtual_pointer_agent_context(&event.device())
+            }
+            InputEvent::PointerButton { event } => {
+                self.virtual_pointer_agent_context(&event.device())
+            }
+            InputEvent::PointerAxis { event } => {
+                self.virtual_pointer_agent_context(&event.device())
+            }
+            _ => None,
+        };
+
+        let Some((seat, target)) = agent else {
+            self.process_input_event(event);
+            return;
+        };
+
+        // Fail closed: agent pointer events are dropped until the session is fully unlocked.
+        if !self.niri.agent_input_allowed() {
+            return;
+        }
+
+        match event {
+            InputEvent::PointerMotion { event } => {
+                self.on_agent_pointer_motion(&seat, target.as_ref(), event)
+            }
+            InputEvent::PointerMotionAbsolute { event } => {
+                self.on_agent_pointer_motion_absolute(&seat, target.as_ref(), event)
+            }
+            InputEvent::PointerButton { event } => self.on_agent_pointer_button(&seat, event),
+            InputEvent::PointerAxis { event } => {
+                self.on_agent_pointer_axis(&seat, target.as_ref(), event)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn virtual_pointer_agent_context(
+        &self,
+        device: &VirtualPointerDevice,
+    ) -> Option<(Seat<State>, Option<WlSurface>)> {
+        let wl_seat = device.wl_seat()?;
+        let seat = self.agent_seat_for(wl_seat)?;
+        let target = self.niri.agent_pointer_targets.get(wl_seat).cloned();
+        Some((seat, target))
+    }
+
+    fn constrain_agent_pointer_location(
+        &self,
+        previous: Point<f64, Logical>,
+        mut next: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        if self.niri.global_space.output_under(next).next().is_some() {
+            return next;
+        }
+
+        if let Some(output) = self.niri.global_space.output_under(previous).next() {
+            let geom = self.niri.global_space.output_geometry(output).unwrap();
+            next.x = next
+                .x
+                .clamp(geom.loc.x as f64, (geom.loc.x + geom.size.w - 1) as f64);
+            next.y = next
+                .y
+                .clamp(geom.loc.y as f64, (geom.loc.y + geom.size.h - 1) as f64);
+            return next;
+        }
+
+        self.niri
+            .global_space
+            .outputs()
+            .next()
+            .and_then(|output| self.niri.global_space.output_geometry(output))
+            .map(|geom| center(geom).to_f64())
+            .unwrap_or(previous)
+    }
+
+    fn agent_contents(
+        &self,
+        target: Option<&WlSurface>,
+        pos: Point<f64, Logical>,
+    ) -> PointContents {
+        match target {
+            Some(surface) => self.niri.agent_target_contents(surface, pos),
+            None => self.niri.contents_under(pos),
+        }
+    }
+
+    fn on_agent_pointer_motion(
+        &mut self,
+        seat: &Seat<State>,
+        target: Option<&WlSurface>,
+        event: VirtualPointerMotionEvent,
+    ) {
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+
+        let previous = pointer.current_location();
+        let next = self.constrain_agent_pointer_location(previous, previous + event.delta());
+        let under = self.agent_contents(target, next);
+
+        pointer.motion(
+            self,
+            under.surface.clone(),
+            &MotionEvent {
+                location: next,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time(),
+            },
+        );
+        pointer.relative_motion(
+            self,
+            under.surface,
+            &RelativeMotionEvent {
+                delta: event.delta(),
+                delta_unaccel: event.delta_unaccel(),
+                time: event.time(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_agent_pointer_motion_absolute(
+        &mut self,
+        seat: &Seat<State>,
+        target: Option<&WlSurface>,
+        event: VirtualPointerMotionAbsoluteEvent,
+    ) {
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+
+        let Some(pos) = self
+            .compute_absolute_location::<VirtualPointerBackend>(&event, None)
+            .or_else(|| {
+                self.global_bounding_rectangle().map(|output_geo| {
+                    event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
+                })
+            })
+        else {
+            return;
+        };
+        let pos = self.constrain_agent_pointer_location(pointer.current_location(), pos);
+        let under = self.agent_contents(target, pos);
+
+        pointer.motion(
+            self,
+            under.surface,
+            &MotionEvent {
+                location: pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_agent_pointer_button(&mut self, seat: &Seat<State>, event: VirtualPointerButtonEvent) {
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+
+        // Clicking with an isolated pointer may move only that seat's keyboard focus. The
+        // compositor's layout focus and the primary seat remain unchanged.
+        if event.state() == ButtonState::Pressed {
+            if let (Some(keyboard), Some(focus)) = (seat.get_keyboard(), pointer.current_focus()) {
+                keyboard.set_focus(self, Some(focus), serial);
+            }
+        }
+
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button: event.button_code(),
+                state: event.state(),
+                serial,
+                time: event.time(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn on_agent_pointer_axis(
+        &mut self,
+        seat: &Seat<State>,
+        target: Option<&WlSurface>,
+        event: VirtualPointerAxisEvent,
+    ) {
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+
+        // A fresh scroll session can emit an axis frame without first moving its virtual pointer.
+        // Re-pick focus against the client-local activation target so a previous session's
+        // pointer focus cannot receive the scroll.
+        if let Some(target) = target {
+            let location = pointer.current_location();
+            let under = self.niri.agent_target_contents(target, location);
+            pointer.motion(
+                self,
+                under.surface,
+                &MotionEvent {
+                    location,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time(),
+                },
+            );
+            pointer.frame(self);
+        }
+
+        let source = event.source();
+        let mut frame = AxisFrame::new(event.time()).source(source);
+        for axis in [Axis::Horizontal, Axis::Vertical] {
+            let amount = event.amount(axis).unwrap_or(0.0);
+            if amount != 0.0 {
+                frame = frame
+                    .relative_direction(axis, event.relative_direction(axis))
+                    .value(axis, amount);
+                if let Some(v120) = event.amount_v120(axis) {
+                    frame = frame.v120(axis, v120 as i32);
+                }
+            }
+
+            if matches!(source, AxisSource::Finger | AxisSource::Continuous)
+                && event.amount(axis) == Some(0.0)
+            {
+                frame = frame.stop(axis);
+            }
+        }
+
+        pointer.axis(self, frame);
+        pointer.frame(self);
     }
 
     /// Computes the rectangle that covers all outputs in global space.

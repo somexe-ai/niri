@@ -26,6 +26,8 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 };
 use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use wayland_backend::client::Backend;
 use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
@@ -63,6 +65,7 @@ pub struct State {
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub virtual_pointer: Option<ZwlrVirtualPointerV1>,
+    pub virtual_keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
@@ -101,6 +104,7 @@ pub struct LayerSurface {
 
 #[derive(Debug, Default)]
 pub struct Seat {
+    pub name: String,
     pub keyboard: Option<Keyboard>,
 }
 
@@ -264,6 +268,7 @@ impl Client {
             layer_shell: None,
             virtual_pointer_manager: None,
             virtual_pointer: None,
+            virtual_keyboard_manager: None,
             spbm: None,
             viewporter: None,
             ksim: None,
@@ -447,6 +452,44 @@ impl State {
         let pointer = manager.create_virtual_pointer(None, &self.qh, ());
         self.virtual_pointer = Some(pointer.clone());
         pointer
+    }
+
+    /// Returns the `wl_seat` with the given name.
+    pub fn seat_named(&self, name: &str) -> WlSeat {
+        self.seats
+            .iter()
+            .find(|(_, seat)| seat.name == name)
+            .map(|(proxy, _)| proxy.clone())
+            .unwrap_or_else(|| panic!("no seat named {name}"))
+    }
+
+    /// Creates a new virtual keyboard for the given seat and sends it the given keymap.
+    pub fn virtual_keyboard_for_seat(
+        &mut self,
+        seat: &WlSeat,
+        keymap: &str,
+    ) -> ZwpVirtualKeyboardV1 {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+
+        use smithay::reexports::rustix::fs::{memfd_create, MemfdFlags};
+
+        let manager = self.virtual_keyboard_manager.as_ref().unwrap();
+        let keyboard = manager.create_virtual_keyboard(seat, &self.qh, ());
+
+        let fd = memfd_create("niri-test-keymap", MemfdFlags::CLOEXEC).unwrap();
+        let mut file = std::fs::File::from(fd);
+        file.write_all(keymap.as_bytes()).unwrap();
+        // The keymap is a NUL-terminated string.
+        file.write_all(&[0]).unwrap();
+        keyboard.keymap(1, file.as_fd(), keymap.len() as u32 + 1);
+        keyboard
+    }
+
+    /// Creates a new virtual pointer for the given seat.
+    pub fn virtual_pointer_for_seat(&mut self, seat: &WlSeat) -> ZwlrVirtualPointerV1 {
+        let manager = self.virtual_pointer_manager.as_ref().unwrap();
+        manager.create_virtual_pointer(Some(seat), &self.qh, ())
     }
 }
 
@@ -663,6 +706,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrVirtualPointerManagerV1::interface().name {
                     let version = min(version, ZwlrVirtualPointerManagerV1::interface().version);
                     state.virtual_pointer_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpVirtualKeyboardManagerV1::interface().name {
+                    let version = min(version, ZwpVirtualKeyboardManagerV1::interface().version);
+                    state.virtual_keyboard_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
@@ -750,7 +796,9 @@ impl Dispatch<WlSeat, ()> for State {
                     }
                 }
             }
-            wl_seat::Event::Name { .. } => (),
+            wl_seat::Event::Name { name } => {
+                state.seats.get_mut(seat).unwrap().name = name;
+            }
             _ => unreachable!(),
         }
     }
@@ -873,6 +921,8 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
 
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerManagerV1);
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerV1);
+wayland_client::delegate_noop!(State: ZwpVirtualKeyboardManagerV1);
+wayland_client::delegate_noop!(State: ZwpVirtualKeyboardV1);
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(

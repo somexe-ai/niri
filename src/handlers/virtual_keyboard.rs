@@ -14,7 +14,8 @@
 //!   `DeviceRemoved`).
 
 use smithay::backend::input::{Event, InputEvent, KeyboardKeyEvent};
-use smithay::input::keyboard::KeymapFile;
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, KeymapFile};
+use smithay::input::Seat;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::input_method::InputMethodSeat;
 use smithay::wayland::virtual_keyboard::{
@@ -34,6 +35,25 @@ pub struct VirtualKeyboardKeymap {
 
 impl VirtualKeyboardHandler for State {
     fn process_virtual_keyboard_event(&mut self, event: InputEvent<VirtualKeyboardBackend>) {
+        // Virtual keyboards created for an agent seat drive only that seat.
+        let agent_device = match &event {
+            InputEvent::DeviceAdded { device } | InputEvent::DeviceRemoved { device } => {
+                Some(device.clone())
+            }
+            InputEvent::Keyboard { event } => Some(event.device()),
+            InputEvent::Special(
+                VirtualKeyboardSpecialEvent::Modifiers { device, .. }
+                | VirtualKeyboardSpecialEvent::KeymapChanged { device },
+            ) => Some(device.clone()),
+            _ => None,
+        };
+        if let Some(device) = agent_device {
+            if let Some(seat) = self.agent_seat_for(device.wl_seat()) {
+                self.process_agent_virtual_keyboard_event(&seat, event);
+                return;
+            }
+        }
+
         match event {
             InputEvent::Keyboard { event } => {
                 let device = event.device();
@@ -119,6 +139,85 @@ impl VirtualKeyboardHandler for State {
 }
 
 impl State {
+    /// Handles an event from a virtual keyboard created for one of the agent seats.
+    ///
+    /// Unlike the primary seat, these keys bypass key bindings, grabs, the input method and the
+    /// shared virtual keyboard keymap bookkeeping: they go straight to the agent seat's own
+    /// keyboard, and so only reach that seat's focused surface.
+    fn process_agent_virtual_keyboard_event(
+        &mut self,
+        seat: &Seat<State>,
+        event: InputEvent<VirtualKeyboardBackend>,
+    ) {
+        let Some(keyboard) = seat.get_keyboard() else {
+            return;
+        };
+
+        match event {
+            InputEvent::Keyboard { event } => {
+                // Fail closed while locked. Focus is also cleared when locking starts.
+                if !self.niri.agent_input_allowed() {
+                    return;
+                }
+
+                self.activate_agent_keymap(&keyboard, &event.device());
+                keyboard.input_from_source::<(), _>(
+                    event.device().source(),
+                    self,
+                    event.key_code(),
+                    event.state(),
+                    SERIAL_COUNTER.next_serial(),
+                    event.time(),
+                    |_, _, _| FilterResult::Forward,
+                );
+            }
+            InputEvent::Special(VirtualKeyboardSpecialEvent::Modifiers {
+                device,
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+            }) => {
+                if !self.niri.agent_input_allowed() {
+                    return;
+                }
+
+                self.activate_agent_keymap(&keyboard, &device);
+                keyboard.with_xkb_state(self, |mut context| {
+                    context.set_modifier_mask(mods_depressed, mods_latched, mods_locked, group);
+                });
+            }
+            // The new keymap will be activated by the next key or modifiers event, and smithay
+            // has already released any keys held by a removed device.
+            _ => (),
+        }
+    }
+
+    /// Switches an agent seat's keyboard to the virtual keyboard's keymap, unless it already is.
+    ///
+    /// A device without a keymap (`no_keymap`) reads its keycodes with the agent seat's default
+    /// one.
+    fn activate_agent_keymap(
+        &mut self,
+        keyboard: &KeyboardHandle<State>,
+        device: &VirtualKeyboardDevice,
+    ) {
+        let Some(keymap) = device
+            .keymap()
+            .or_else(|| self.niri.agent_default_keymap.clone())
+        else {
+            return;
+        };
+
+        if keyboard.keymap_file().id() == keymap.id() {
+            return;
+        }
+
+        if let Err(err) = keyboard.set_keymap_from_keymap_file(self, keymap) {
+            warn!("error setting agent virtual keyboard keymap: {err:?}");
+        }
+    }
+
     /// Whether the virtual keyboard belongs to the input method that has grabbed the keyboard.
     pub fn is_input_method_virtual_keyboard(&self, device: &VirtualKeyboardDevice) -> bool {
         let grab_client = self.niri.seat.input_method().keyboard_grab_client();

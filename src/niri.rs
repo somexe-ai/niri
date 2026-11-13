@@ -67,6 +67,7 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_scre
 use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, GlobalId,
 };
+use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
@@ -358,6 +359,19 @@ pub struct Niri {
     pub single_pixel_buffer_state: SinglePixelBufferState,
 
     pub seat: Seat<State>,
+    /// Synthetic seats used by background computer-use agents.
+    ///
+    /// Each seat owns an independent pointer and keyboard focus. They are intentionally
+    /// separate from the physical/user seat so virtual input can target a client without
+    /// moving the user's cursor or changing the layout keyboard focus.
+    pub agent_seats: Vec<Seat<State>>,
+    /// Keymap the agent seats start with, restored when a virtual keyboard sends `no_keymap`.
+    pub agent_default_keymap: Option<KeymapFile>,
+    /// Per-client target selected by wlr-foreign-toplevel activation for an
+    /// agent seat. Keying by the concrete wl_seat resource (rather than the
+    /// underlying Seat) keeps independent Wayland connections from inheriting
+    /// each other's pointer target.
+    pub agent_pointer_targets: HashMap<WlSeat, WlSurface>,
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
     /// Button codes of the mouse buttons to suppress.
@@ -2588,7 +2602,67 @@ fn reset_damage_tracker_if_changed(
     }
 }
 
+/// Creates `count` (at most 8) agent seats named `niri-agent-N`.
+///
+/// Also returns the keymap the agent keyboards start with.
+fn create_agent_seats(
+    seat_state: &mut SeatState<State>,
+    display_handle: &DisplayHandle,
+    keyboard_config: &niri_config::input::Keyboard,
+    count: usize,
+) -> (Vec<Seat<State>>, Option<KeymapFile>) {
+    const MAX_AGENT_SEAT_COUNT: usize = 8;
+    let count = count.min(MAX_AGENT_SEAT_COUNT);
+
+    let mut seats = Vec::with_capacity(count);
+    let mut default_keymap = None;
+    for idx in 0..count {
+        let mut seat = seat_state.new_wl_seat(display_handle, format!("niri-agent-{}", idx + 1));
+        let keyboard = match seat.add_keyboard(
+            keyboard_config.xkb.to_xkb_config(),
+            keyboard_config.repeat_delay.into(),
+            keyboard_config.repeat_rate.into(),
+        ) {
+            Err(err) => {
+                warn!("error adding keyboard for agent seat {}: {err:?}", idx + 1);
+                seat.add_keyboard(
+                    Default::default(),
+                    keyboard_config.repeat_delay.into(),
+                    keyboard_config.repeat_rate.into(),
+                )
+                .unwrap()
+            }
+            Ok(keyboard) => keyboard,
+        };
+        if keyboard_config.numlock {
+            let mut modifier_state = keyboard.modifier_state();
+            modifier_state.num_lock = true;
+            keyboard.set_modifier_state(modifier_state);
+        }
+        if default_keymap.is_none() {
+            default_keymap = Some(keyboard.keymap_file());
+        }
+        seat.add_pointer();
+        seats.push(seat);
+    }
+
+    (seats, default_keymap)
+}
+
 impl Niri {
+    /// Adds agent seats after startup, for tests.
+    #[cfg(test)]
+    pub fn add_agent_seats(&mut self, count: usize) {
+        let (seats, default_keymap) = create_agent_seats(
+            &mut self.seat_state,
+            &self.display_handle,
+            &self.config.borrow().input.keyboard,
+            count,
+        );
+        self.agent_seats = seats;
+        self.agent_default_keymap = default_keymap;
+    }
+
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<'static, State>,
@@ -2772,6 +2846,25 @@ impl Niri {
         }
         seat.add_pointer();
 
+        // Expose a small pool of independent Wayland seats for background computer-use
+        // agents. Keeping these as real wl_seat globals means standard
+        // zwlr_virtual_pointer_v1 and zwp_virtual_keyboard_v1 clients can opt into
+        // isolated focus without a compositor-private input protocol.
+        //
+        // This is opt-in: many generic virtual-keyboard clients simply bind the last
+        // advertised wl_seat. Advertising an unfocused agent seat by default would silently
+        // redirect those existing tools away from the user's primary seat.
+        let agent_seat_count = std::env::var("NIRI_AGENT_SEATS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let (agent_seats, agent_default_keymap) = create_agent_seats(
+            &mut seat_state,
+            &display_handle,
+            &config_.input.keyboard,
+            agent_seat_count,
+        );
+
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(&display_handle);
         let cursor_manager =
             CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
@@ -2954,6 +3047,9 @@ impl Niri {
             single_pixel_buffer_state,
 
             seat,
+            agent_seats,
+            agent_default_keymap,
+            agent_pointer_targets: HashMap::new(),
             keyboard_focus: KeyboardFocus::Layout { surface: None },
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),
@@ -3688,6 +3784,63 @@ impl Niri {
     pub fn window_under_cursor(&self) -> Option<&Mapped> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.window_under(pos)
+    }
+
+    /// Returns input contents for an agent-selected toplevel, ignoring the primary seat's
+    /// stacking/focus order.
+    ///
+    /// The supplied point remains in compositor-global coordinates. We look up the target's tile
+    /// in its own workspace and hit-test that tile directly, so an occluding window (or another
+    /// active workspace) cannot steal the background agent pointer focus.
+    pub fn agent_target_contents(
+        &self,
+        target: &WlSurface,
+        pos: Point<f64, Logical>,
+    ) -> PointContents {
+        let mut rv = PointContents::default();
+
+        let Some((mapped, Some(output))) = self.layout.find_window_and_output(target) else {
+            return rv;
+        };
+        let Some(output_geo) = self.global_space.output_geometry(output) else {
+            return rv;
+        };
+
+        rv.output = Some(output.clone());
+        let pos_within_output = pos - output_geo.loc.to_f64();
+        let target_id = mapped.id();
+
+        let hit = self.layout.workspaces().find_map(|(_, _, workspace)| {
+            workspace
+                .tiles_with_render_positions()
+                .find_map(|(tile, tile_pos, _visible)| {
+                    if tile.window().id() != target_id {
+                        return None;
+                    }
+
+                    HitType::hit_tile(tile, tile_pos, pos_within_output).map(|(_window, hit)| hit)
+                })
+        });
+
+        let Some(hit) = hit else {
+            return rv;
+        };
+
+        let window = &mapped.window;
+        rv.surface = if let HitType::Input { win_pos } = hit {
+            window
+                .surface_under(pos_within_output - win_pos, WindowSurfaceType::ALL)
+                .map(|(surface, pos_within_window)| {
+                    (
+                        surface,
+                        pos_within_window.to_f64() + win_pos + output_geo.loc.to_f64(),
+                    )
+                })
+        } else {
+            None
+        };
+        rv.window = Some((window.clone(), hit));
+        rv
     }
 
     /// Returns contents under the given point.
@@ -6852,6 +7005,14 @@ impl Niri {
             LockState::Unlocked | LockState::WaitingForSurfaces { .. } => false,
             LockState::Locking(_) | LockState::Locked(_) => true,
         }
+    }
+
+    /// Background synthetic input is only permitted while the session is fully unlocked.
+    ///
+    /// In particular, the pre-lock WaitingForSurfaces transition is treated as closed to agents
+    /// so a virtual keyboard cannot retain a target across a lock boundary.
+    pub fn agent_input_allowed(&self) -> bool {
+        matches!(self.lock_state, LockState::Unlocked)
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
